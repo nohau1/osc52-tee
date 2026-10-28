@@ -48,8 +48,50 @@ cd osc52-tee
 ./install.sh
 ```
 
-`install.sh` copies `osc52-tee` and `ossh` to `~/.local/bin` (override with
-`PREFIX=/usr/local ./install.sh`). Make sure that directory is in `PATH`.
+`install.sh` creates the target directory if it does not exist (default
+`~/.local/bin`) and installs `osc52-tee` and `ossh` there. Override the prefix
+with `PREFIX=/usr/local ./install.sh`.
+
+### Add `~/.local/bin` to `PATH`
+
+Check whether it is already there:
+
+```sh
+echo "$PATH" | tr ':' '\n' | grep -x "$HOME/.local/bin"
+```
+
+If nothing is printed, add it:
+
+```sh
+# bash
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
+. ~/.bashrc
+
+# zsh
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc
+. ~/.zshrc
+
+# fish
+fish_add_path "$HOME/.local/bin"
+```
+
+Or let the installer update the profile of your current shell:
+
+```sh
+./install.sh --add-to-path
+```
+
+For login shells add the same line to `~/.profile`. On many distributions
+`~/.local/bin` is added automatically once the directory exists, so opening a
+new terminal after installation may be enough.
+
+Verify:
+
+```sh
+command -v ossh
+```
+
+If you used a custom `PREFIX`, replace `~/.local/bin` with `$PREFIX/bin` above.
 
 ## Usage
 
@@ -303,13 +345,53 @@ cd osc52-tee
 ./install.sh
 ```
 
-`install.sh` копирует `osc52-tee` и `ossh` в `~/.local/bin`. Другой префикс:
+`install.sh` сам создаёт каталог установки, если его нет (по умолчанию
+`~/.local/bin`), и кладёт туда `osc52-tee` и `ossh`. Другой префикс:
 
 ```sh
 PREFIX=/usr/local ./install.sh
 ```
 
-Убедитесь, что каталог установки есть в `PATH`.
+### Добавление `~/.local/bin` в `PATH`
+
+Проверьте, есть ли каталог в `PATH`:
+
+```sh
+echo "$PATH" | tr ':' '\n' | grep -x "$HOME/.local/bin"
+```
+
+Если пусто — добавьте:
+
+```sh
+# bash
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
+. ~/.bashrc
+
+# zsh
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc
+. ~/.zshrc
+
+# fish
+fish_add_path "$HOME/.local/bin"
+```
+
+Или доверьте это установщику:
+
+```sh
+./install.sh --add-to-path
+```
+
+Для логин-шеллов добавьте ту же строку в `~/.profile`. Во многих дистрибутивах
+`~/.local/bin` подхватывается автоматически, если каталог существует — после
+установки может быть достаточно открыть новый терминал.
+
+Проверка:
+
+```sh
+command -v ossh
+```
+
+Если использовали свой `PREFIX`, замените `~/.local/bin` на `$PREFIX/bin`.
 
 ## Быстрый старт: `ossh`
 

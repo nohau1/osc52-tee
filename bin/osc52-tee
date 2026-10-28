@@ -1,0 +1,385 @@
+#!/usr/bin/env python3
+"""osc52-tee -- transparent PTY wrapper that mirrors OSC 52 clipboard writes.
+
+The wrapped program keeps talking to the real terminal byte-for-byte.  This
+wrapper only observes the byte stream, decodes every OSC 52 clipboard write
+(`ESC ] 52 ; <target> ; <base64> BEL|ST`), and optionally:
+
+  * pipes the decoded bytes to a local clipboard command (wl-copy, xclip,
+    pbcopy, clip.exe, ...);
+  * appends a human-readable copy to a log file (handy for `tail -f`);
+  * appends one base64 line per copy to a stream file.
+
+Typical use: run it around ssh on the machine that owns the clipboard, so
+copies made by a remote TUI (OpenCode, vim, tmux, ...) land in the local
+clipboard even when the terminal emulator does not implement OSC 52.
+
+Examples:
+  osc52-tee --copy-command wl-copy --no-log --no-stream -- ssh server
+  osc52-tee --copy-command 'xclip -selection clipboard -i' -- ssh server
+  osc52-tee --log ~/clip.log -- opencode
+
+Security: OSC 52 is a write-only channel here; the wrapper never answers
+clipboard read queries.  The remote side can overwrite the local clipboard,
+so only use it with hosts you trust.  See SECURITY.md.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import errno
+import os
+import pty
+import queue
+import select
+import shlex
+import signal
+import subprocess
+import sys
+import termios
+import threading
+import time
+import tty
+
+__version__ = "1.0.0"
+
+OSC52_MARKER = b"\x1b]52;"
+BEL = 0x07
+ST = b"\x1b\\"
+CHUNK = 131072
+DEFAULT_MAX_BYTES = 1024 * 1024
+DEFAULT_QUEUE_SIZE = 16
+DEFAULT_LOG = "~/.local/share/osc52-tee/clipboard.log"
+DEFAULT_STREAM = "~/.local/share/osc52-tee/clipboard.b64"
+
+
+def env_value(*names: str, default: str = "") -> str:
+    for name in names:
+        value = os.environ.get(name)
+        if value is not None:
+            return value
+    return default
+
+
+class Osc52Parser:
+    """Incremental parser for OSC 52 sequences in a forwarded byte stream."""
+
+    def __init__(self, max_bytes: int = DEFAULT_MAX_BYTES) -> None:
+        self.max_bytes = max(1, int(max_bytes))
+        self._buf = b""
+        self.dropped = 0
+
+    def feed(self, data: bytes) -> list[bytes]:
+        self._buf += data
+        found: list[bytes] = []
+
+        while True:
+            start = self._buf.find(OSC52_MARKER)
+            if start < 0:
+                # Keep a small tail: the marker may be split across reads.
+                if len(self._buf) > len(OSC52_MARKER) + 2:
+                    self._buf = self._buf[-(len(OSC52_MARKER) + 2) :]
+                return found
+
+            bel = self._buf.find(b"\x07", start)
+            st = self._buf.find(ST, start)
+            ends = [pos for pos in (bel, st) if pos >= 0]
+            if not ends:
+                # Incomplete payload. Cap the buffer so a broken/hostile
+                # stream cannot grow it without bound.
+                limit = self.max_bytes * 2 + 4096
+                if len(self._buf) > limit:
+                    self._buf = b""
+                    self.dropped += 1
+                return found
+
+            end = min(ends)
+            sequence = self._buf[start:end]
+            self._buf = self._buf[end + (1 if end == bel else 2) :]
+
+            parts = sequence.split(b";", 2)
+            if len(parts) != 3:
+                continue
+
+            payload = parts[2].strip()
+            if payload in (b"", b"?"):  # empty clear or a read query
+                continue
+
+            try:
+                payload += b"=" * (-len(payload) % 4)
+                decoded = base64.b64decode(payload, validate=False)
+            except Exception:
+                self.dropped += 1
+                continue
+
+            if not decoded:
+                continue
+            if len(decoded) > self.max_bytes:
+                self.dropped += 1
+                continue
+            found.append(decoded)
+
+
+class CopySink:
+    """Serialise clipboard writes through one worker thread.
+
+    A bounded queue keeps a hostile/misbehaving remote from spawning an
+    unbounded number of clipboard processes.
+    """
+
+    def __init__(self, command: list[str], queue_size: int = DEFAULT_QUEUE_SIZE) -> None:
+        self._command = list(command)
+        self._queue: queue.Queue = queue.Queue(maxsize=max(1, queue_size))
+        self._thread: threading.Thread | None = None
+        self.dropped = 0
+        if self._command:
+            self._thread = threading.Thread(target=self._run, name="osc52-copy", daemon=True)
+            self._thread.start()
+
+    def submit(self, data: bytes) -> None:
+        if self._thread is None or not data:
+            return
+        try:
+            self._queue.put_nowait(data)
+        except queue.Full:
+            self.dropped += 1
+
+    def _run(self) -> None:
+        while True:
+            data = self._queue.get()
+            if data is None:
+                return
+            try:
+                subprocess.run(
+                    self._command,
+                    input=data,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=10,
+                    check=False,
+                )
+            except Exception:
+                pass
+
+    def close(self) -> None:
+        if self._thread is None:
+            return
+        try:
+            self._queue.put(None, timeout=5)
+        except queue.Full:
+            pass
+        self._thread.join(timeout=5)
+
+
+def open_append(path: str) -> int | None:
+    if not path:
+        return None
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    return os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+
+
+def write_copy(log_fd: int | None, stream_fd: int | None, data: bytes) -> None:
+    if log_fd is not None:
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        text = data.decode("utf-8", "replace")
+        block = f"\n===== copy {stamp} =====\n{text}".encode("utf-8", "replace")
+        if not block.endswith(b"\n"):
+            block += b"\n"
+        try:
+            os.write(log_fd, block)
+        except OSError:
+            pass
+
+    if stream_fd is not None:
+        try:
+            os.write(stream_fd, base64.b64encode(data) + b"\n")
+        except OSError:
+            pass
+
+
+def copy_winsize(src: int, dst: int) -> None:
+    try:
+        size = termios.tcgetwinsize(src)
+        termios.tcsetwinsize(dst, size)
+        return
+    except (OSError, AttributeError):
+        pass
+    # Python < 3.11.
+    try:
+        import fcntl
+
+        size = fcntl.ioctl(src, termios.TIOCGWINSZ, b"\0" * 8)
+        fcntl.ioctl(dst, termios.TIOCSWINSZ, size)
+    except OSError:
+        pass
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="osc52-tee",
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
+    parser.add_argument(
+        "--copy-command",
+        default=env_value("OSC52_TEE_COPY_COMMAND", "OPENCODE_COPY_COMMAND"),
+        metavar="CMD",
+        help="pipe each decoded copy to CMD's stdin (parsed with shlex, no shell)",
+    )
+    parser.add_argument(
+        "--log",
+        default=env_value("OSC52_TEE_LOG", "OPENCODE_CLIP_LOG", default=DEFAULT_LOG),
+        metavar="FILE",
+        help="human-readable copy log ('' disables)",
+    )
+    parser.add_argument(
+        "--stream",
+        default=env_value("OSC52_TEE_STREAM", "OPENCODE_CLIP_STREAM", default=DEFAULT_STREAM),
+        metavar="FILE",
+        help="one base64 line per copy ('' disables)",
+    )
+    parser.add_argument("--no-log", action="store_true", help="disable the human-readable log")
+    parser.add_argument("--no-stream", action="store_true", help="disable the base64 stream")
+    try:
+        default_max_bytes = int(
+            env_value("OSC52_TEE_MAX_BYTES", "OPENCODE_CLIP_MAX_BYTES", default=str(DEFAULT_MAX_BYTES))
+        )
+    except ValueError:
+        default_max_bytes = DEFAULT_MAX_BYTES
+    parser.add_argument(
+        "--max-bytes",
+        type=int,
+        default=default_max_bytes,
+        metavar="N",
+        help="skip copies larger than N bytes after decoding (default: %(default)s)",
+    )
+    parser.add_argument("cmd", nargs=argparse.REMAINDER, metavar="command", help="command to run")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    command = list(args.cmd)
+    if command and command[0] == "--":
+        command = command[1:]
+    if not command:
+        command = ["opencode"]
+
+    try:
+        copy_argv = shlex.split(args.copy_command) if args.copy_command else []
+    except ValueError as exc:
+        parser.error(f"invalid --copy-command: {exc}")
+
+    log_path = "" if args.no_log else os.path.abspath(os.path.expanduser(args.log))
+    stream_path = "" if args.no_stream else os.path.abspath(os.path.expanduser(args.stream))
+    try:
+        log_fd = open_append(log_path)
+        stream_fd = open_append(stream_path)
+    except OSError as exc:
+        parser.error(f"cannot open output file: {exc}")
+    sink = CopySink(copy_argv)
+
+    stdin_fd = sys.stdin.fileno()
+    stdout_fd = sys.stdout.fileno()
+    is_tty = os.isatty(stdin_fd)
+    old_attrs = termios.tcgetattr(stdin_fd) if is_tty else None
+
+    pid, master = pty.fork()
+    if pid == 0:  # child
+        try:
+            os.execvpe(command[0], command, os.environ)
+        except FileNotFoundError:
+            os.write(2, f"osc52-tee: command not found: {command[0]}\n".encode())
+            os._exit(127)
+        except Exception as exc:
+            os.write(2, f"osc52-tee: {exc}\n".encode())
+            os._exit(126)
+
+    resize = [False]
+
+    def on_winch(_signum, _frame):
+        resize[0] = True
+
+    def on_term(signum, _frame):
+        try:
+            os.kill(pid, signum)
+        except OSError:
+            pass
+
+    signal.signal(signal.SIGWINCH, on_winch)
+    signal.signal(signal.SIGTERM, on_term)
+    signal.signal(signal.SIGHUP, on_term)
+
+    if is_tty:
+        tty.setraw(stdin_fd)
+    copy_winsize(stdin_fd, master)
+
+    osc = Osc52Parser(max_bytes=args.max_bytes)
+    watch_stdin = True
+    try:
+        while True:
+            if resize[0]:
+                copy_winsize(stdin_fd, master)
+                resize[0] = False
+
+            fds = [master] + ([stdin_fd] if watch_stdin else [])
+            try:
+                ready, _, _ = select.select(fds, [], [], 0.5)
+            except InterruptedError:
+                continue
+
+            if master in ready:
+                try:
+                    data = os.read(master, CHUNK)
+                except OSError as exc:
+                    if exc.errno == errno.EIO:  # child closed the PTY
+                        break
+                    raise
+                if not data:
+                    break
+                for payload in osc.feed(data):
+                    write_copy(log_fd, stream_fd, payload)
+                    sink.submit(payload)
+                try:
+                    os.write(stdout_fd, data)
+                except OSError:
+                    break
+
+            if watch_stdin and stdin_fd in ready:
+                try:
+                    data = os.read(stdin_fd, CHUNK)
+                except OSError:
+                    watch_stdin = False
+                    continue
+                if not data:
+                    watch_stdin = False
+                    continue
+                try:
+                    os.write(master, data)
+                except OSError:
+                    break
+    finally:
+        sink.close()
+        if is_tty and old_attrs is not None:
+            try:
+                termios.tcsetattr(stdin_fd, termios.TCSAFLUSH, old_attrs)
+            except OSError:
+                pass
+        if log_fd is not None:
+            os.close(log_fd)
+        if stream_fd is not None:
+            os.close(stream_fd)
+
+    try:
+        _, status = os.waitpid(pid, 0)
+    except ChildProcessError:
+        status = 0
+    return os.waitstatus_to_exitcode(status)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

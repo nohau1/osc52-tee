@@ -1,0 +1,19 @@
+#!/bin/sh
+# Run the OpenCode TUI and mirror every clipboard copy to files.
+#
+# Useful when OpenCode runs on a remote host and the local terminal does not
+# support OSC 52.  The copies are appended to
+#   ~/.local/share/osc52-tee/clipboard.log   (human-readable)
+#   ~/.local/share/osc52-tee/clipboard.b64   (one base64 line per copy)
+#
+# Usage:
+#   occlip                # same as "opencode"
+#   occlip -c             # continue the last session
+#   occlip -s ses_...     # resume a specific session
+#
+# Then, in another terminal:
+#   tail -f ~/.local/share/osc52-tee/clipboard.log
+
+exec osc52-tee --log ~/.local/share/osc52-tee/clipboard.log \
+    --stream ~/.local/share/osc52-tee/clipboard.b64 \
+    -- opencode "$@"

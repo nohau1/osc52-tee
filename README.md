@@ -1,5 +1,7 @@
 # osc52-tee
 
+[![ci](https://github.com/nohau1/osc52-tee/actions/workflows/ci.yml/badge.svg)](https://github.com/nohau1/osc52-tee/actions/workflows/ci.yml)
+
 A tiny, dependency-free PTY wrapper that makes **copy from remote terminal apps**
 work when your terminal emulator ignores [OSC 52](https://invisible-island.net/xterm/ctlseqs/ctlseqs.html#h3-Operating-System-Commands).
 
@@ -39,7 +41,7 @@ Requirements: Python 3.9+ on the machine that owns the clipboard. No third-party
 packages.
 
 ```sh
-git clone https://github.com/<you>/osc52-tee.git
+git clone https://github.com/nohau1/osc52-tee.git
 cd osc52-tee
 ./install.sh
 ```
